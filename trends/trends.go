@@ -24,7 +24,7 @@ type Trends struct {
 	cache *ristretto.Cache
 }
 
-var defaultTTL = time.Hour * 24
+var defaultTTL = time.Hour * 48
 
 func New(l *logrusx.Logger, token string) *Trends {
 	var c http.Client
