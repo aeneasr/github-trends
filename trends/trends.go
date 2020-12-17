@@ -35,7 +35,7 @@ func New(l *logrusx.Logger, token string) *Trends {
 
 	cache, _ := ristretto.NewCache(&ristretto.Config{
 		NumCounters: 1e7,
-		MaxCost:     1 << 30,
+		MaxCost:     150000000,
 		BufferItems: 64,
 	})
 
