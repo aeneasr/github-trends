@@ -1,6 +1,6 @@
 # github-trends
 
-A utility to plot GitHub stars over time. Inspired by [starchart.cc]() but allows to plot a user's or organization's
+A utility to plot GitHub stars over time. Inspired by [caarlos0/starcharts](https://github.com/caarlos0/starcharts) but allows to plot a user's or organization's
 stars as well.
 
 To embed this on your own site, use the URL
