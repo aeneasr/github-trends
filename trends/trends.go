@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"golang.org/x/sync/errgroup"
 	"net/http"
 	"sort"
 	"time"
@@ -34,10 +35,7 @@ func New(l *logrusx.Logger, token string) *Trends {
 	}
 
 	cache, _ := ristretto.NewCache(&ristretto.Config{
-		NumCounters: 1e7,
-		MaxCost:     150000000,
-		BufferItems: 64,
-	})
+		NumCounters: 1e7, MaxCost: 150000000, BufferItems: 64})
 
 	return &Trends{gc: github.NewClient(&c), l: l, cache: cache}
 }
@@ -67,7 +65,7 @@ func (t *Trends) handleStars(w http.ResponseWriter, r *http.Request, _ httproute
 	}
 
 	var err error
-	var gazers []*github.Stargazer
+	var gazers []int64
 	if len(repo) == 0 {
 		gazers, err = t.listGazers(r.Context(), user)
 	} else {
@@ -91,109 +89,238 @@ func (t *Trends) handleStars(w http.ResponseWriter, r *http.Request, _ httproute
 	sendSVG(w, svg.Bytes())
 }
 
-func (t *Trends) listGazers(ctx context.Context, user string) (gazers []*github.Stargazer, err error) {
+func (t *Trends) listGazers(ctx context.Context, user string) (gazers []int64, err error) {
 	repos, err := t.getRepositories(ctx, user)
 	if err != nil {
 		return nil, err
 	}
 
-	for k := range repos {
-		repo := repos[k]
-		owner := *repo.Owner.Login
-		name := *repo.Name
+	group, ctx := errgroup.WithContext(ctx)
+	itemChan := make(chan []int64)
 
-		t.l.WithField("owner", owner).WithField("repository", name).Debug("Checking stars for repository.")
-		parts, err := t.getStargazers(ctx, owner, name)
-		if err != nil {
-			t.l.WithError(err).Error("Unable to fetch stargazers.")
-			return nil, err
-		}
+	for _, repo := range repos {
+		func(repo repository) {
+			group.Go(func() error {
+				t.l.WithField("owner", repo.owner).WithField("repository", repo.name).Debug("Checking stars for repository.")
+				parts, err := t.getStargazers(ctx, repo.owner, repo.name)
+				if err != nil {
+					t.l.WithError(err).Error("Unable to fetch stargazers.")
+					return err
+				}
 
-		gazers = append(gazers, parts...)
-		t.l.WithField("counts", len(gazers)).Info("Found stargazers.")
+				t.l.WithField("counts", len(parts)).WithField("repo", repo).Info("Found stargazers.")
+
+				select {
+				case itemChan <- parts:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+
+				return nil
+			})
+		}(repo)
 	}
-	return
+
+	go func() {
+		_ = group.Wait()
+		close(itemChan)
+	}()
+
+	for g := range itemChan {
+		gazers = append(gazers, g...)
+	}
+
+	if err := group.Wait(); err != nil {
+		return nil, err
+	}
+
+	return gazers, nil
 }
 
 func repositoriesCacheKey(user string, page int) string {
 	return fmt.Sprintf("repos/%s/%d", user, page)
 }
 
-type repositoriesCache struct {
-	repos    []*github.Repository
-	nextPage int
+type repository struct {
+	name  string
+	owner string
 }
 
-func (t *Trends) getRepositories(ctx context.Context, user string) (repos []*github.Repository, err error) {
-	opt := &github.RepositoryListOptions{
-		Sort:        "created",
-		ListOptions: github.ListOptions{PerPage: 100},
+type repositoriesCache struct {
+	repos []repository
+	*pagination
+}
+
+func (t *Trends) listRepositories(ctx context.Context, user string, page int) (*repositoriesCache, error) {
+	cacheKey := repositoriesCacheKey(user, page)
+
+	if item, found := t.cache.Get(cacheKey); found {
+		t.l.WithField("cache_key", cacheKey).Debug("Found repository in cache.")
+		return item.(*repositoriesCache), nil
 	}
 
-	for {
-		var parts []*github.Repository
-
-		cacheKey := repositoriesCacheKey(user, opt.Page)
-		if item, found := t.cache.Get(repositoriesCacheKey(user, opt.Page)); found {
-			opt.Page = item.(*repositoriesCache).nextPage
-			parts = item.(*repositoriesCache).repos
-			t.l.WithField("cache_key", cacheKey).Debug("Found repositories in cache.")
-		} else {
-			p, resp, err := t.gc.Repositories.List(ctx, user, opt)
-			if err != nil {
-				return nil, err
-			}
-			t.cache.SetWithTTL(cacheKey, &repositoriesCache{repos: p, nextPage: resp.NextPage}, 0, defaultTTL)
-
-			opt.Page = resp.NextPage
-			parts = p
-		}
-
-		repos = append(repos, parts...)
-		if opt.Page == 0 {
-			break
-		}
+	p, resp, err := t.gc.Repositories.List(ctx, user, &github.RepositoryListOptions{Sort: "created",
+		ListOptions: github.ListOptions{PerPage: 100, Page: page}})
+	if err != nil {
+		return nil, err
 	}
 
-	return
+	repos := make([]repository, len(p))
+	for k, repo := range p {
+		repos[k] = repository{name: *repo.Name, owner: *repo.Owner.Login}
+	}
+
+	item := &repositoriesCache{repos: repos, pagination: &pagination{
+		LastPage: resp.LastPage,
+		NextPage: resp.NextPage}}
+	t.cache.SetWithTTL(cacheKey, item, 0, defaultTTL)
+
+	return item, nil
+}
+
+func (t *Trends) getRepositories(ctx context.Context, user string) (repos []repository, err error) {
+	item, err := t.listRepositories(ctx, user, 1)
+	if err != nil {
+		return nil, err
+	}
+
+	t.l.WithField("repos", item.repos).WithField("pagination", item.pagination).Debug("Found repos in pre-queue.")
+
+	repos = append(repos, item.repos...)
+	if item.NextPage == 0 {
+		return repos, nil
+	}
+
+	group, ctx := errgroup.WithContext(ctx)
+	itemChan := make(chan *repositoriesCache)
+
+	for page := item.NextPage; page <= item.LastPage; page++ {
+		func(page int) { // set page for subroutine
+			group.Go(func() error {
+				item, err := t.listRepositories(ctx, user, page)
+				if err != nil {
+					return err
+				}
+				t.l.WithField("repos", item.repos).WithField("page", page).WithField("pagination", item.pagination).Debug("Found repos in loop queue.")
+				select {
+				case itemChan <- item:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+				return nil
+			})
+		}(page)
+	}
+
+	go func() {
+		_ = group.Wait()
+		close(itemChan)
+	}()
+
+	for item := range itemChan {
+		repos = append(repos, item.repos...)
+	}
+
+	if err := group.Wait(); err != nil {
+		return nil, err
+	}
+
+	return repos, nil
 }
 
 func stargazersCacheKey(user, repo string, page int) string {
 	return fmt.Sprintf("gazers/%s/%s/%d", user, repo, page)
 }
 
-type stargazerCache struct {
-	gazers   []*github.Stargazer
-	nextPage int
+type pagination struct {
+	NextPage int
+	LastPage int
 }
 
-func (t *Trends) getStargazers(ctx context.Context, user, repository string) (gazers []*github.Stargazer, err error) {
-	opt := &github.ListOptions{PerPage: 100}
-	for {
-		var parts []*github.Stargazer
+type stargazerCache struct {
+	gazers []int64
+	*pagination
+}
 
-		cacheKey := stargazersCacheKey(user, repository, opt.Page)
-		if item, found := t.cache.Get(cacheKey); found {
-			opt.Page = item.(*stargazerCache).nextPage
-			parts = item.(*stargazerCache).gazers
-			t.l.WithField("cache_key", cacheKey).Debug("Found stargazers in cache.")
-		} else {
-			p, resp, err := t.gc.Activity.ListStargazers(context.Background(), user, repository, opt)
-			if err != nil {
-				return nil, err
-			}
-			opt.Page = resp.NextPage
-			t.cache.SetWithTTL(cacheKey, &stargazerCache{gazers: p, nextPage: resp.NextPage}, 0, defaultTTL)
-			parts = p
-		}
+func (t *Trends) listStargazerPage(ctx context.Context, user, repository string, page int) (*stargazerCache, error) {
+	cacheKey := stargazersCacheKey(user, repository, page)
 
-		gazers = append(gazers, parts...)
-		if opt.Page == 0 {
-			break
-		}
+	if item, found := t.cache.Get(cacheKey); found {
+		t.l.WithField("cache_key", cacheKey).Debug("Found stargazers in cache.")
+		return item.(*stargazerCache), nil
 	}
 
-	return
+	p, resp, err := t.gc.Activity.ListStargazers(ctx, user, repository, &github.ListOptions{PerPage: 100, Page: page})
+	if err != nil {
+		return nil, err
+	}
+
+	gazers := make([]int64, len(p))
+	for k := range p {
+		gazers[k] = p[k].StarredAt.Time.Unix()
+	}
+
+	item := &stargazerCache{gazers: gazers, pagination: &pagination{
+		LastPage: resp.LastPage,
+		NextPage: resp.NextPage,
+	}}
+	t.cache.SetWithTTL(cacheKey, item, 0, defaultTTL)
+
+	return item, nil
+}
+
+func (t *Trends) getStargazers(ctx context.Context, user, repository string) (gazers []int64, err error) {
+	item, err := t.listStargazerPage(ctx, user, repository, 1)
+	if err != nil {
+		return nil, err
+	}
+
+	t.l.WithField("gazers", item.gazers).WithField("repo", fmt.Sprintf("%s/%s", user, repository)).
+		WithField("pagination", item.pagination).Debug("Found gazers in pre-queue.")
+
+	gazers = append(gazers, item.gazers...)
+	if item.NextPage == 0 {
+		return gazers, nil
+	}
+
+	group, ctx := errgroup.WithContext(ctx)
+	itemChan := make(chan *stargazerCache)
+
+	for page := item.NextPage; page <= item.LastPage; page++ {
+		func(page int) {
+			group.Go(func() error {
+				item, err := t.listStargazerPage(ctx, user, repository, page)
+				if err != nil {
+					return err
+				}
+
+				t.l.WithField("gazers", item.gazers).WithField("repo", fmt.Sprintf("%s/%s", user, repository)).
+					WithField("pagination", item.pagination).Debug("Found gazers in page queue.")
+
+				select {
+				case itemChan <- item:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+				return nil
+			})
+		}(page)
+	}
+
+	go func() {
+		_ = group.Wait()
+		close(itemChan)
+	}()
+
+	for item := range itemChan {
+		gazers = append(gazers, item.gazers...)
+	}
+
+	if err := group.Wait(); err != nil {
+		return nil, err
+	}
+
+	return gazers, nil
 }
 
 // IntValueFormatter is a ValueFormatter for int.
@@ -201,7 +328,7 @@ func IntValueFormatter(v interface{}) string {
 	return fmt.Sprintf("%.0f", v)
 }
 
-func (t *Trends) renderSVG(gazers []*github.Stargazer) (*bytes.Buffer, error) {
+func (t *Trends) renderSVG(gazers []int64) (*bytes.Buffer, error) {
 	t.l.WithField("counts", len(gazers)).Info("Render SVG for repositories.")
 
 	var series = chart.TimeSeries{
@@ -210,11 +337,10 @@ func (t *Trends) renderSVG(gazers []*github.Stargazer) (*bytes.Buffer, error) {
 			StrokeColor: drawing.Color{R: 129, G: 199, B: 239, A: 255},
 			StrokeWidth: 2}}
 
-	sorted := ByStars{Gazers: gazers}
-	sort.Sort(sorted)
+	sort.Slice(gazers, func(i, j int) bool { return gazers[i] < gazers[j] })
 
-	for i, star := range sorted.Gazers {
-		series.XValues = append(series.XValues, star.StarredAt.Time)
+	for i, star := range gazers {
+		series.XValues = append(series.XValues, time.Unix(star, 0))
 		series.YValues = append(series.YValues, float64(i))
 	}
 
@@ -264,10 +390,3 @@ func (t *Trends) renderSVG(gazers []*github.Stargazer) (*bytes.Buffer, error) {
 
 	return &b, nil
 }
-
-type ByStars struct{ Gazers []*github.Stargazer }
-
-func (s ByStars) Less(i, j int) bool { return s.Gazers[i].StarredAt.Before(s.Gazers[j].StarredAt.Time) }
-
-func (s ByStars) Len() int      { return len(s.Gazers) }
-func (s ByStars) Swap(i, j int) { s.Gazers[i], s.Gazers[j] = s.Gazers[j], s.Gazers[i] }

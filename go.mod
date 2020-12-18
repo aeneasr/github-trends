@@ -13,4 +13,5 @@ require (
 	github.com/spf13/cobra v1.1.1
 	github.com/wcharczuk/go-chart v2.0.1+incompatible
 	golang.org/x/oauth2 v0.0.0-20201203001011-0b49973bad19
+	golang.org/x/sync v0.0.0-20201020160332-67f06af15bc9
 )
